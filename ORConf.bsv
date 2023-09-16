@@ -7,18 +7,17 @@ import BRAM::*;
 
 typedef Vector#(16, Reg#(Word)) RegisterFile;
 typedef Bit#(32) Word;
+
+// Register selector.
 typedef Bit#(4) OpRegister;
 
+// A description of an Operand - either a register or immediate.
 typedef union tagged {
     OpRegister R;
     Word Imm;
-} OpRegisterImmediate deriving (Bits, FShow);
-
-typedef union tagged {
-    OpRegisterImmediate RI;
-    OpRegister R;
 } Operand deriving (Bits, FShow);
 
+// Actual instruction set. VLIW (currenttly 72 bits).
 typedef union tagged {
     struct {
         Operand from;
@@ -46,25 +45,17 @@ typedef struct {
     Word vop2;
 } Decoded deriving (Bits, FShow);
 
+// Given an Operand and a RegisterFile state, return the value from the
+// described Operand.
 function Word resolveOperand(Operand op, RegisterFile rf);
     case (op) matches
-        tagged RI .ri: begin
-            case (ri) matches
-                tagged R .r: begin
-                    return rf[r];
-                end
-                tagged Imm .v: begin
-                    return v;
-                end
-            endcase
-        end
-        tagged R .r: begin
-            return rf[r];
-        end
+        tagged Imm .v: return v;
+        tagged R .r: return rf[r];
     endcase
 endfunction
 
 module mkCPU(Empty);
+    // Define two BRAMs: one for intructions, one for data.
     BRAM_Configure cfg = defaultValue;
     cfg.allowWriteResponseBypass = False;
     cfg.loadFormat = tagged Hex "bram.txt";
@@ -72,13 +63,20 @@ module mkCPU(Empty);
     cfg.loadFormat = tagged None;
     BRAM2Port#(Bit#(8), Word) dram <- mkBRAM2Server(cfg);
 
+    // Define register file.
     RegisterFile regs <- replicateM(mkReg(0));
+    
+    // Interface to register file writeback operations: two RWires that allow a
+    // rule to provide a next PC (from fetch) or register writeback (from
+    // execute). PC write conflicts get unified by the registerWB rule.
     RWire#(Tuple2#(OpRegister, Word)) regWB <- mkRWire;
     RWire#(Word) regWBPC <- mkRWire;
 
+    // Pipeline FIFOs between fetch/decode and decode/execute stages.
     FIFO#(Word) fFetch <- mkPipelineFIFO;
     FIFO#(Decoded) fDecode <- mkPipelineFIFO;
 
+    // Fetch instruction, emit next PC to writeback logic.
     rule fetch;
         $display("Fetch: %x", regs[0]);
         iram.portA.request.put(BRAMRequest { write: False
@@ -90,10 +88,14 @@ module mkCPU(Empty);
         fFetch.enq(regs[0]);
     endrule
 
+    // Rule which unifies register file writebacks. Currently there's two
+    // possible sources for RF writes: the execute stage (any register write)
+    // or the fetch stage (next PC).
     rule registerWB;
         Maybe#(Word) pc = regWBPC.wget();
         let wb = regWB.wget();
 
+        // This could be probably made more generic with a fold.
         case (tuple2(pc, wb)) matches
             { ._, tagged Valid { 0, .wpc } }: begin
                 regs[0] <= wpc;
@@ -108,6 +110,7 @@ module mkCPU(Empty);
         endcase
     endrule
 
+    // Decode instruction and schedule data memory fetch.
     rule decode;
         let pc = fFetch.first;
         fFetch.deq();
@@ -116,6 +119,7 @@ module mkCPU(Empty);
         Instruction ins = unpack(word);
         $display("Decode: ", fshow(ins), " at ", fshow(pc));
 
+        // Calculate operand values.
         Maybe#(Operand) op1 = case (ins) matches
             tagged Move .move: return tagged Valid move.from;
             tagged Load .load: return tagged Valid load.addr;
@@ -136,6 +140,7 @@ module mkCPU(Empty);
             tagged Valid .op: return resolveOperand(op, regs);
         endcase;
 
+        // Always fetch data memory.
         dram.portA.request.put(BRAMRequest { write: False
                                           , responseOnWrite: False
                                           , address: truncate(vop1)
@@ -149,6 +154,8 @@ module mkCPU(Empty);
                             });
     endrule
 
+    // Execute instruction: write back to register file via registerWB, write
+    // to memory if needed, call ALU if needed.
     rule execute;
         let decoded = fDecode.first;
         fDecode.deq();
